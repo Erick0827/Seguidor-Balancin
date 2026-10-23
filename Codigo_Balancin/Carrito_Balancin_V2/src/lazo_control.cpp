@@ -2,7 +2,7 @@
 #include "config.h"
 #include "motor.h"
 #include "imu.h"
-#include "controlador_pd.h"
+#include "controlador_pid.h"
 #include "controlador_pi.h"
 #include "calibracion.h"
 #include "boton.h"
@@ -11,10 +11,16 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-// Cada cuántos ciclos base se ejecuta cada lazo
-const uint32_t CICLOS_MOTOR  = TS_MS / TS_BASE_MS;
-const uint32_t CICLOS_ANGULO = TS_ANGULO_MS / TS_BASE_MS;
-const uint32_t CICLOS_GIRO   = TS_GIRO_MS / TS_BASE_MS;
+// Cada cuántos ciclos de TS_TICK_MS se ejecuta cada parte
+const uint32_t CICLOS_MPU    = TS_BASE_MS / TS_TICK_MS;
+const uint32_t CICLOS_KALMAN = TS_KALMAN_MS / TS_TICK_MS;
+const uint32_t CICLOS_MOTOR  = TS_MS / TS_TICK_MS;
+const uint32_t CICLOS_ANGULO = TS_ANGULO_MS / TS_TICK_MS;
+const uint32_t CICLOS_GIRO   = TS_GIRO_MS / TS_TICK_MS;
+const uint32_t CICLOS_POSICION = TS_POSICION_MS / TS_TICK_MS;
+
+// rpm -> m/s con el perímetro de la rueda
+const float MS_POR_RPM = PI * DIAMETRO_RUEDA / 60.0f;
 
 //--------------------------------------------------
 // Datos compartidos con el núcleo 0 (protegidos por el candado)
@@ -33,9 +39,13 @@ static volatile uint32_t sobrepasos = 0;
 //--------------------------------------------------
 // Estado propio de la tarea de control (solo núcleo 1)
 //--------------------------------------------------
-static ControladorPD controlAngulo;
+static ControladorPID controlAngulo;
 static ControladorPIPosicional controlGiro;
-static float anguloRef = ANGULO_EQUILIBRIO;
+static ControladorPID controlPosicion;
+static float ajusteAngulo = AJUSTE_ANGULO;  // se suma a la medida del sensor (°)
+static float posicionRef = POSICION_REF;    // set point de desplazamiento (m)
+static float anguloRef = 0;          // set point de ángulo = salida del desplazamiento (°)
+static long cuentasOrigen = 0;       // cuentas1 + cuentas2 al empezar a equilibrar
 
 static bool imuLista = false;      // false si el MPU no respondió al iniciar
 static bool activo = false;        // true = controlando
@@ -49,7 +59,30 @@ static void detenerControladores()
   activo = false;
   rpmAngulo = 0;
   rpmGiro = 0;
+  anguloRef = 0;
   reiniciarPIPosicional(controlGiro);
+  reiniciarPID(controlAngulo);
+  reiniciarPID(controlPosicion);
+}
+
+// Ángulo del sensor con el ajuste aplicado (0° = equilibrio)
+static float anguloAjustado()
+{
+  return anguloInclinacion() + ajusteAngulo;
+}
+
+// Suma de las cuentas con signo de ambos encoders (positiva al avanzar)
+static long sumaCuentas()
+{
+  return cuentasConSigno(motor1) + cuentasConSigno(motor2);
+}
+
+// Al empezar a equilibrar: el punto actual pasa a ser la posición a mantener
+static void activarControl()
+{
+  activo = true;
+  cuentasOrigen = sumaCuentas();
+  tomarVelocidadGiro();  // descarta lo acumulado mientras estaba detenido
 }
 
 // Copia los parámetros pedidos desde la web (sin borrar el integrador del giro)
@@ -72,10 +105,15 @@ static void aplicarParametrosNuevos()
   if (!hay) return;
 
   controlAngulo.kp = p.kpAngulo;
+  controlAngulo.ki = p.kiAngulo;
   controlAngulo.kd = p.kdAngulo;
-  anguloRef = p.anguloRef;
+  ajusteAngulo = p.ajusteAngulo;
+  posicionRef = p.posicionRef;
   controlGiro.kp = p.kpGiro;
   controlGiro.ki = p.kiGiro;
+  controlPosicion.kp = p.kpPosicion;
+  controlPosicion.ki = p.kiPosicion;
+  controlPosicion.kd = p.kdPosicion;
 }
 
 static bool leerHabilitado()
@@ -86,17 +124,18 @@ static bool leerHabilitado()
   return hab;
 }
 
-// Rutina del botón de calibración. Al terminar con éxito el ángulo de
-// equilibrio pasa a ser el set point de ángulo (también en la web).
+// Rutina del botón de calibración. Al terminar con éxito el ajuste del
+// sensor pasa a ser -(ángulo de equilibrio), así ese punto se lee como 0°
+// (también se actualiza en la web).
 // true si se escribió en la flash (el ciclo tardó más de lo normal).
 static bool atenderCalibracion(bool lecturaOk)
 {
-  float anguloNuevo;
-  if (!pasoCalibracion(botonPulsado(), leerHabilitado(), lecturaOk, anguloNuevo)) return false;
+  float anguloEquilibrio;
+  if (!pasoCalibracion(botonPulsado(), leerHabilitado(), lecturaOk, anguloEquilibrio)) return false;
 
-  anguloRef = anguloNuevo;
+  ajusteAngulo = -anguloEquilibrio;
   portENTER_CRITICAL(&candado);
-  parametros.anguloRef = anguloNuevo;
+  parametros.ajusteAngulo = ajusteAngulo;
   portEXIT_CRITICAL(&candado);
   return true;
 }
@@ -115,7 +154,7 @@ static void supervisarSeguridad(bool lecturaOk)
 
   fallasMPU = lecturaOk ? 0 : fallasMPU + 1;
   bool mpuOk = imuLista && fallasMPU < MPU_FALLAS_MAX;
-  float desvio = fabsf(anguloInclinacion() - anguloRef);
+  float desvio = fabsf(anguloAjustado());
   bool enLimites = mpuOk && desvio <= ANGULO_CAIDA;
 
   if (cal || !hab || !mpuOk) {
@@ -127,9 +166,8 @@ static void supervisarSeguridad(bool lecturaOk)
       motivo = PARO_CAIDA;
     }
   } else if (desvio < ANGULO_REARME) {
-    activo = true;
+    activarControl();
     motivo = PARO_NINGUNO;
-    tomarVelocidadGiro();  // descarta lo acumulado mientras estaba detenido
   } else if (motivo != PARO_CAIDA) {
     motivo = PARO_ESPERA_VERTICAL;  // el aviso de caída se mantiene hasta el rearme
   }
@@ -148,10 +186,21 @@ static void lazoGiro()
   rpmGiro = calcularPIPosicional(controlGiro, e);
 }
 
+// Desplazamiento x (m) desde el origen y velocidad lineal v (m/s).
+// La salida es el set point del controlador de ángulo (±ANGULO_MAX_POSICION):
+// si el carrito pasó la referencia hacia adelante, pide inclinarse hacia
+// atrás y el carrito regresa.
+static void lazoPosicion()
+{
+  float x = (float)(sumaCuentas() - cuentasOrigen) * 0.5f * M_X_CUENTA;
+  float v = (motor1.rpm + motor2.rpm) * 0.5f * MS_POR_RPM;
+  anguloRef = calcularPID(controlPosicion, posicionRef - x, 0.0f - v);
+}
+
 static void lazoAngulo()
 {
-  float e = anguloInclinacion() - anguloRef;
-  rpmAngulo = calcularPD(controlAngulo, e, velocidadCaida());
+  float e = anguloAjustado() - anguloRef;
+  rpmAngulo = calcularPID(controlAngulo, e, velocidadCaida());
 }
 
 static void lazoMotores()
@@ -168,7 +217,7 @@ static void lazoMotores()
 // siempre los últimos segundos aunque nadie esté mirando la página)
 static void guardarMuestra()
 {
-  MuestraControl m = { anguloRef, anguloInclinacion(),
+  MuestraControl m = { anguloRef, anguloAjustado(),
                        rpmAngulo + rpmGiro, motor1.rpm,
                        rpmAngulo - rpmGiro, motor2.rpm };
   if (xQueueSend(colaMuestras, &m, 0) != pdTRUE) {
@@ -182,49 +231,66 @@ static void guardarMuestra()
 // lo que no depende del esp_timer ni de nada que corra en el núcleo 0.
 static void tareaLazoControl(void *arg)
 {
-  const TickType_t periodo = pdMS_TO_TICKS(TS_BASE_MS);
+  const TickType_t periodo = pdMS_TO_TICKS(TS_TICK_MS);
   TickType_t ultimoDespertar = xTaskGetTickCount();
   uint32_t ciclo = 0;
 
   for (;;) {
-    // pdFALSE: el ciclo anterior tardó más de TS_BASE_MS y no hubo espera
+    // pdFALSE: el ciclo anterior tardó más de TS_TICK_MS y no hubo espera
     if (xTaskDelayUntil(&ultimoDespertar, periodo) == pdFALSE) sobrepasos = sobrepasos + 1;
 
-    aplicarParametrosNuevos();
-    bool lecturaOk = imuLista && actualizarIMU();
-    if (atenderCalibracion(lecturaOk)) {
-      // La escritura en flash pausó la tarea: se retoma el periodo desde
-      // ahora en vez de recuperar los ciclos perdidos de golpe
-      ultimoDespertar = xTaskGetTickCount();
+    bool tocaMPU = ciclo % CICLOS_MPU == 0;
+    bool lecturaOk = false;
+
+    // Cada TS_BASE_MS: lectura del MPU, botón y calibración
+    if (tocaMPU) {
+      aplicarParametrosNuevos();
+      lecturaOk = imuLista && actualizarIMU();
+      if (atenderCalibracion(lecturaOk)) {
+        // La escritura en flash pausó la tarea: se retoma el periodo desde
+        // ahora en vez de recuperar los ciclos perdidos de golpe
+        ultimoDespertar = xTaskGetTickCount();
+      }
     }
-    supervisarSeguridad(lecturaOk);
+
+    // Cada TS_KALMAN_MS: estimación del ángulo con la última lectura
+    if (imuLista && ciclo % CICLOS_KALMAN == 0) actualizarAnguloKalman();
+
+    // La seguridad usa el ángulo ya actualizado
+    if (tocaMPU) supervisarSeguridad(lecturaOk);
 
     // Primero los lazos externos, para que los motores usen la referencia recién calculada
-    if (activo && ciclo % CICLOS_GIRO == 0)   lazoGiro();
-    if (activo && ciclo % CICLOS_ANGULO == 0) lazoAngulo();
+    if (activo && ciclo % CICLOS_GIRO == 0)     lazoGiro();
+    if (activo && ciclo % CICLOS_POSICION == 0) lazoPosicion();
+    if (activo && ciclo % CICLOS_ANGULO == 0)   lazoAngulo();
     if (ciclo % CICLOS_MOTOR == 0)            lazoMotores();
     if (ciclo % CICLOS_ANGULO == 0)           guardarMuestra();
 
-    ciclo = (ciclo + 1) % (CICLOS_MOTOR * CICLOS_ANGULO * CICLOS_GIRO);
+    // Múltiplo común de todos los periodos, para que el contador no rompa la secuencia
+    ciclo = (ciclo + 1) % (CICLOS_MPU * CICLOS_KALMAN * CICLOS_MOTOR * CICLOS_ANGULO *
+                           CICLOS_GIRO * CICLOS_POSICION);
   }
 }
 
 bool iniciarLazoControl()
 {
-  configurarPD(controlAngulo, KP_ANGULO, KD_ANGULO, RPM_MAX_ANGULO);
+  configurarPID(controlAngulo, KP_ANGULO, KI_ANGULO, KD_ANGULO, TS_ANGULO, RPM_MAX_ANGULO);
   configurarPIPosicional(controlGiro, KP_GIRO, KI_GIRO, TS_GIRO, RPM_MAX_GIRO);
+  configurarPID(controlPosicion, KP_POSICION, KI_POSICION, KD_POSICION, TS_POSICION,
+                ANGULO_MAX_POSICION);
   detenerControladores();
 
   CalibracionGuardada cal;
   bool hayCalibracion = cargarCalibracion(cal);
   if (hayCalibracion) {
-    anguloRef = cal.anguloEquilibrio;
-    Serial.printf("# Calibración cargada de la flash: equilibrio %.2f°\n", anguloRef);
+    ajusteAngulo = -cal.anguloEquilibrio;
+    Serial.printf("# Calibración cargada de la flash: equilibrio %.2f°\n", cal.anguloEquilibrio);
   } else {
     Serial.println("# Sin calibración guardada: calibrando giroscopio, mantener el carrito quieto...");
   }
 
-  parametros = { KP_ANGULO, KD_ANGULO, anguloRef, KP_GIRO, KI_GIRO };
+  parametros = { KP_ANGULO, KI_ANGULO, KD_ANGULO, ajusteAngulo, KP_GIRO, KI_GIRO,
+                 KP_POSICION, KI_POSICION, KD_POSICION, posicionRef };
   estadoPublico = { false, false, false, PARO_APAGADO };
   colaMuestras = xQueueCreate(TAMANO_COLA_MUESTRAS, sizeof(MuestraControl));
   iniciarBoton();

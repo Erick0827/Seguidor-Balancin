@@ -56,9 +56,12 @@ static void responderJSON(const String &json)
 static String parametrosJSON()
 {
   ParametrosControl p = obtenerParametros();
-  char b[160];
-  snprintf(b, sizeof(b), "{\"kpa\":%g,\"kda\":%g,\"ref\":%g,\"kpg\":%g,\"kig\":%g}",
-           p.kpAngulo, p.kdAngulo, p.anguloRef, p.kpGiro, p.kiGiro);
+  char b[256];
+  snprintf(b, sizeof(b),
+           "{\"kpa\":%g,\"kia\":%g,\"kda\":%g,\"aja\":%g,\"kpg\":%g,\"kig\":%g,"
+           "\"kpx\":%g,\"kix\":%g,\"kdx\":%g,\"xref\":%g}",
+           p.kpAngulo, p.kiAngulo, p.kdAngulo, p.ajusteAngulo, p.kpGiro, p.kiGiro,
+           p.kpPosicion, p.kiPosicion, p.kdPosicion, p.posicionRef);
   return String(b);
 }
 
@@ -118,10 +121,15 @@ static void rutaParametros()
   if (servidor.method() == HTTP_POST) {
     ParametrosControl p = obtenerParametros();
     leerArgumento("kpa", p.kpAngulo);
+    leerArgumento("kia", p.kiAngulo);
     leerArgumento("kda", p.kdAngulo);
-    leerArgumento("ref", p.anguloRef);
+    leerArgumento("aja", p.ajusteAngulo);
     leerArgumento("kpg", p.kpGiro);
     leerArgumento("kig", p.kiGiro);
+    leerArgumento("kpx", p.kpPosicion);
+    leerArgumento("kix", p.kiPosicion);
+    leerArgumento("kdx", p.kdPosicion);
+    leerArgumento("xref", p.posicionRef);
     fijarParametros(p);
   }
   responderJSON(parametrosJSON());

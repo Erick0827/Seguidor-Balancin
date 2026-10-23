@@ -76,6 +76,11 @@ void medirRPM(Motor &m)
   m.rpm = rpm;
 }
 
+long cuentasConSigno(const Motor &m)
+{
+  return m.sentido * m.conteoAnterior;
+}
+
 void controlarVelocidad(Motor &m, float ref, bool reiniciar)
 {
   if (reiniciar) {

@@ -1,5 +1,6 @@
 #include "imu.h"
 #include "config.h"
+#include "filtro_kalman.h"
 
 // Tercer eje: el que apunta hacia adelante
 const int EJE_AVANCE = 3 - EJE_RUEDAS - EJE_VERTICAL;
@@ -10,10 +11,8 @@ const int EJE_AVANCE = 3 - EJE_RUEDAS - EJE_VERTICAL;
 // aceleración de avance.
 const float SIGNO_ACEL = ((EJE_VERTICAL - EJE_RUEDAS + 3) % 3 == 1) ? -1.0f : 1.0f;
 
-const float ALFA = TAU_COMPLEMENTARIO / (TAU_COMPLEMENTARIO + TS_BASE);
-
 static LecturaMPU ultima = {};
-static float angulo = 0;
+static FiltroKalman kalman;
 static float velCaida = 0;
 static float sumaGiro = 0;
 static int muestrasGiro = 0;
@@ -26,6 +25,7 @@ float anguloDesdeAcelerometro(const float acel[3])
 
 bool iniciarIMU(const float *biasGiro)
 {
+  configurarKalman(kalman, KALMAN_Q_ANGULO, KALMAN_Q_SESGO, KALMAN_R_MEDIDA);
   if (!iniciarMPU()) return false;
 
   if (biasGiro != NULL) fijarOffsetGiro(biasGiro);
@@ -43,11 +43,23 @@ bool actualizarIMU()
   ultima = l;
 
   velCaida = SIGNO_ANGULO * l.giro[EJE_RUEDAS];
-  angulo = ALFA * (angulo + velCaida * TS_BASE) + (1.0f - ALFA) * anguloDesdeAcelerometro(l.acel);
 
   sumaGiro += SIGNO_GIRO * l.giro[EJE_VERTICAL];
   muestrasGiro++;
   return true;
+}
+
+void actualizarAnguloKalman()
+{
+  // Predicción con la velocidad de caída de la última lectura (mismo eje y signo)
+  predecirKalman(kalman, velCaida, TS_KALMAN);
+
+  // Corrección solo si el acelerómetro mide casi solo la gravedad
+  const float *a = ultima.acel;
+  float magnitud = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+  if (fabsf(magnitud - 1.0f) <= KALMAN_RECHAZO_G) {
+    corregirKalman(kalman, anguloDesdeAcelerometro(a));
+  }
 }
 
 const LecturaMPU &ultimaLecturaIMU()
@@ -57,7 +69,9 @@ const LecturaMPU &ultimaLecturaIMU()
 
 void fijarAnguloIMU(float a)
 {
-  angulo = a;
+  // El driver ya resta el bias calibrado: el sesgo del Kalman parte de 0
+  // y solo estima el residuo
+  reiniciarKalman(kalman, a, 0);
   velCaida = 0;
   sumaGiro = 0;
   muestrasGiro = 0;
@@ -65,7 +79,7 @@ void fijarAnguloIMU(float a)
 
 float anguloInclinacion()
 {
-  return angulo;
+  return kalman.angulo;
 }
 
 float velocidadCaida()

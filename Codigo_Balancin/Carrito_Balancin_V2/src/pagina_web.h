@@ -5,7 +5,7 @@
     1. Encendido de motores y variables de estado
     2. Gráficas: ángulo (set point y medido) y RPM (set point y medida
        de cada motor, con selector Ambos / Motor 1 / Motor 2)
-    3. Constantes de los controladores de ángulo y de giro
+    3. Constantes de los controladores de ángulo, giro y desplazamiento
     4. Voltaje de la batería (ingreso manual)
   Las secciones 2, 3 y 4 se pueden contraer.
 */
@@ -89,14 +89,21 @@ input{width:100%}
 <details class="tarjeta" open>
   <summary>Constantes de los controladores</summary>
   <form id="fParam">
-    <fieldset><legend>Ángulo (PD)</legend><div class="campos">
+    <fieldset><legend>Ángulo (PID)</legend><div class="campos">
       <label>Kp (rpm/°)<input name="kpa" type="number" step="any" inputmode="decimal"></label>
+      <label>Ki (rpm/(°·s))<input name="kia" type="number" step="any" inputmode="decimal"></label>
       <label>Kd (rpm/(°/s))<input name="kda" type="number" step="any" inputmode="decimal"></label>
-      <label>Set point (°)<input name="ref" type="number" step="any" inputmode="decimal"></label>
+      <label>Ajuste sensor (°)<input name="aja" type="number" step="any" inputmode="decimal"></label>
     </div></fieldset>
     <fieldset><legend>Giro (P / PI)</legend><div class="campos">
       <label>Kp (rpm/(°/s))<input name="kpg" type="number" step="any" inputmode="decimal"></label>
       <label>Ki (rpm/°)<input name="kig" type="number" step="any" inputmode="decimal"></label>
+    </div></fieldset>
+    <fieldset><legend>Desplazamiento (PID)</legend><div class="campos">
+      <label>Kp (°/m)<input name="kpx" type="number" step="any" inputmode="decimal"></label>
+      <label>Ki (°/(m·s))<input name="kix" type="number" step="any" inputmode="decimal"></label>
+      <label>Kd (°/(m/s))<input name="kdx" type="number" step="any" inputmode="decimal"></label>
+      <label>Set point (m)<input name="xref" type="number" step="any" inputmode="decimal"></label>
     </div></fieldset>
     <div class="fila"><button class="aplicar" type="submit">Aplicar</button><span class="msg" id="msg"></span></div>
   </form>
@@ -186,7 +193,7 @@ function mostrarEstado(j) {
   $('btn').disabled = enCurso;
   $('cCal').hidden = j.cal == 0;
   chip('cCal', j.ctxt, enCurso ? 'aviso parpadeo' : (j.cal == 3 ? 'ok' : 'mal'));
-  // Al terminar bien, el set point de ángulo cambió: se recarga el formulario
+  // Al terminar bien, el ajuste del sensor cambió: se recarga el formulario
   if (j.cal == 3 && calAnterior != 3) pedir('/parametros').then(llenarParametros).catch(() => {});
   calAnterior = j.cal;
 }
@@ -212,7 +219,7 @@ async function ciclo() {
 
 function llenarParametros(p) {
   const f = $('fParam');
-  ['kpa','kda','ref','kpg','kig'].forEach(k => f[k].value = p[k]);
+  ['kpa','kia','kda','aja','kpg','kig','kpx','kix','kdx','xref'].forEach(k => f[k].value = p[k]);
 }
 
 $('btn').onclick = async () => {

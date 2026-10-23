@@ -235,3 +235,102 @@ Notas:
     config.cpp.
   - La zona muerta (V_ZONA_MUERTA_1/2) sigue calculada una sola vez al
     arrancar con el V_BATERIA de config.cpp; no cambia con el valor de la web.
+
+
+[2026-10-22] 13. Cambios del usuario en config.h
+-------------------------------------------------
+KP_ANGULO: 0 -> 13 rpm/°,  KD_ANGULO: 0 -> 0.2 rpm/(°/s).
+SENTIDO_MOTOR_1: 1 -> -1,  SENTIDO_MOTOR_2: -1 -> 1.
+
+
+[2026-10-22] 14. Filtro de Kalman para el ángulo de pitch
+----------------------------------------------------------
+Motivo: las vibraciones de la estructura hacían muy ruidoso el ángulo del
+filtro complementario. Se reemplaza por un Kalman de 2 estados.
+filtro_kalman.h / .cpp (nuevo):
+  - Estado x = [ángulo (°), sesgo del giroscopio (°/s)].
+  - predecirKalman(): con la velocidad angular del giroscopio.
+  - corregirKalman(): con el ángulo del acelerómetro (atan2).
+config.h:
+  - KALMAN_Q_ANGULO = 0.001, KALMAN_Q_SESGO = 0.003, KALMAN_R_MEDIDA = 0.1.
+  - KALMAN_RECHAZO_G = 0.15: si |‖a‖ - 1 g| > 0.15 g se omite la corrección
+    y solo se predice (rechazo de vibraciones).
+  - TS_KALMAN_MS = 5 (periodo fijo del filtro).
+  - TS_TICK_MS = 1: la tarea de control ahora despierta cada 1 ms para poder
+    ejecutar el filtro cada 5 ms. NO cambian los tiempos de los
+    controladores (motores 10 ms, ángulo 20 ms, giro 100 ms) ni la lectura
+    del MPU, el botón, la calibración y la seguridad (siguen cada 2 ms).
+  - MPU_DLPF_CFG: 2 -> 3 (registro 0x1A): giroscopio 98 -> 42 Hz,
+    acelerómetro 94 -> 44 Hz. Agrega ~2 ms de retardo al giroscopio
+    (afecta la acción derivativa del ángulo y la velocidad de giro en Z).
+  - Se elimina TAU_COMPLEMENTARIO (filtro complementario retirado).
+imu.h / .cpp:
+  - actualizarIMU() (cada 2 ms) ya no calcula el ángulo; solo guarda la
+    lectura, la velocidad de caída y acumula la velocidad de giro.
+  - Nueva actualizarAnguloKalman() (cada 5 ms): predicción con la velocidad
+    de caída (giroscopio Y, mismo signo que antes), corrección con
+    anguloDesdeAcelerometro() (mismos ejes y signos que antes) si pasa el
+    rechazo de vibraciones.
+  - fijarAnguloIMU() reinicia el Kalman: ángulo = acelerómetro, sesgo = 0
+    (el driver ya resta el bias calibrado; el Kalman estima el residuo), P = 0.
+    La calibración del botón (500 muestras) y el arranque lo usan como antes.
+  - anguloInclinacion() devuelve el ángulo del Kalman.
+lazo_control.cpp: orden por ciclo de 1 ms: [2 ms] lectura MPU + calibración
+  -> [5 ms] Kalman -> [2 ms] seguridad -> giro / ángulo / motores.
+Sin cambios: ganancias, límites, anti-windup, lógica de motores y de giro,
+  velocidadCaida() (acción derivativa con el giroscopio como antes),
+  calibracion.cpp, mpu6050.cpp, web.
+
+
+[2026-10-22] 15. Control de desplazamiento y acción integral en el ángulo
+--------------------------------------------------------------------------
+Objetivo: que el carrito, al equilibrarse, se mantenga en una sola posición.
+Controlador de desplazamiento (PID, cada 100 ms = TS_POSICION_MS):
+  - x = ((cuentas1 + cuentas2)/2) * M_X_CUENTA [m], con
+    M_X_CUENTA = PI*0.067/1960 (DIAMETRO_RUEDA / CPR en config.h).
+    Las cuentas llevan el signo de SENTIDO_MOTOR_x (positivas al avanzar en
+    ambos motores). Se calcula en float, sin la división entera de la
+    fórmula original, para no perder media cuenta.
+  - x se mide desde el punto donde el carrito empezó a equilibrar (cada vez
+    que se activa el control se toma un nuevo origen).
+  - Acción derivativa con la velocidad lineal v = ((rpm1+rpm2)/2)*PI*D/60 [m/s]
+    (rpm ya medidas y filtradas por el lazo de motores).
+  - corrección = Kp*(0-x) + Ki*∫(0-x) + Kd*(0-v), limitada a ±5°
+    (ANGULO_MAX_POSICION). Se suma al set point del controlador de ángulo.
+  - Ganancias KP/KI/KD_POSICION en 0 (por sintonizar).
+Controlador de ángulo: pasa de PD a PID; nueva KI_ANGULO = 0 (con Ki = 0
+  se comporta exactamente igual que antes). El integrador se borra al detenerse.
+Controlador de giro: ya tenía Ki (KI_GIRO), editable en config.h y en la web.
+Archivos:
+  controlador_pid.h / .cpp (nuevo, reemplaza a controlador_pd.h / .cpp, eliminados).
+  config.h: TS_POSICION_MS, KI_ANGULO, sección CONTROLADOR DE DESPLAZAMIENTO,
+            DIAMETRO_RUEDA y M_X_CUENTA (sección ENCODERS).
+  motor.h / .cpp: cuentasConSigno().
+  lazo_control.h / .cpp: lazoPosicion() antes de lazoAngulo(); activarControl()
+    fija el origen de posición; ParametrosControl con kiAngulo, kpPosicion,
+    kiPosicion, kdPosicion; la gráfica de ángulo muestra el set point efectivo
+    (set point + corrección de desplazamiento).
+  servidor_web.cpp / pagina_web.h: campos Ki de ángulo y Kp/Ki/Kd de
+    desplazamiento (claves kia, kpx, kix, kdx).
+
+
+[2026-10-22] 16. El desplazamiento da el set point de ángulo; ajuste del sensor
+--------------------------------------------------------------------------------
+Problema reportado: el carrito tendía a irse hacia una sola dirección.
+Nueva estructura de referencias:
+  - El único set point que entra al sistema es el de desplazamiento
+    (POSICION_REF, en m respecto al punto de inicio; editable en la web).
+  - La salida del controlador de desplazamiento ES el set point del
+    controlador de ángulo (±5°), ya no una corrección sumada a otro set point.
+  - Se elimina el set point manual de ángulo. En su lugar hay un ajuste del
+    sensor que se suma a la medida: ángulo = ángulo_sensor + AJUSTE_ANGULO,
+    de modo que 0° sea el punto de equilibrio.
+  - La calibración del botón ahora fija el ajuste en -(ángulo de equilibrio)
+    (se sigue guardando el mismo dato en la flash; al arrancar se carga así).
+  - Los límites de caída (±30°) y rearme (±5°) se miden sobre el ángulo ajustado.
+  - Las gráficas muestran el ángulo ajustado y el set point que da el desplazamiento.
+config.h: ANGULO_EQUILIBRIO -> AJUSTE_ANGULO (°); nuevo POSICION_REF (m).
+lazo_control.h / .cpp: ParametrosControl: anguloRef -> ajusteAngulo, nuevo
+  posicionRef; anguloAjustado(); lazoPosicion() produce anguloRef.
+servidor_web.cpp / pagina_web.h: campo "ref" (set point de ángulo) reemplazado
+  por "aja" (Ajuste sensor, °); nuevo "xref" (Set point de desplazamiento, m).

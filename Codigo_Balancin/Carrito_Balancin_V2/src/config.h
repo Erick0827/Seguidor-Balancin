@@ -15,22 +15,30 @@
 //==================================================
 // TIEMPOS DE MUESTREO
 //==================================================
-// La tarea de control corre cada TS_BASE_MS (lectura del MPU) y de ahí
-// ejecuta cada lazo cuando le toca. Todos deben ser múltiplos de TS_BASE_MS.
+// La tarea de control despierta cada TS_TICK_MS y de ahí ejecuta cada
+// tarea/lazo cuando le toca. Todos deben ser múltiplos de TS_TICK_MS.
 
-const uint32_t TS_BASE_MS   = 2;    // Lectura del MPU y filtro de ángulo (500 Hz)
+const uint32_t TS_TICK_MS   = 1;    // Periodo de despertar de la tarea de control
+const uint32_t TS_BASE_MS   = 2;    // Lectura del MPU, botón, calibración y seguridad (500 Hz)
+const uint32_t TS_KALMAN_MS = 5;    // Filtro de Kalman del ángulo (200 Hz)
 const uint32_t TS_MS        = 10;   // Lazos PI de velocidad de los motores
-const uint32_t TS_ANGULO_MS = 20;   // Controlador de ángulo (PD)
+const uint32_t TS_ANGULO_MS = 20;   // Controlador de ángulo (PID)
 const uint32_t TS_GIRO_MS   = 100;  // Controlador de giro (P / PI)
+const uint32_t TS_POSICION_MS = 50;  // Controlador de desplazamiento (PID)
 
 const float TS_BASE   = TS_BASE_MS / 1000.0f;
+const float TS_KALMAN = TS_KALMAN_MS / 1000.0f;
 const float TS        = TS_MS / 1000.0f;
 const float TS_ANGULO = TS_ANGULO_MS / 1000.0f;
 const float TS_GIRO   = TS_GIRO_MS / 1000.0f;
+const float TS_POSICION = TS_POSICION_MS / 1000.0f;
 
-static_assert(TS_MS % TS_BASE_MS == 0,        "TS_MS debe ser múltiplo de TS_BASE_MS");
-static_assert(TS_ANGULO_MS % TS_BASE_MS == 0, "TS_ANGULO_MS debe ser múltiplo de TS_BASE_MS");
-static_assert(TS_GIRO_MS % TS_BASE_MS == 0,   "TS_GIRO_MS debe ser múltiplo de TS_BASE_MS");
+static_assert(TS_BASE_MS % TS_TICK_MS == 0,   "TS_BASE_MS debe ser múltiplo de TS_TICK_MS");
+static_assert(TS_KALMAN_MS % TS_TICK_MS == 0, "TS_KALMAN_MS debe ser múltiplo de TS_TICK_MS");
+static_assert(TS_MS % TS_TICK_MS == 0,        "TS_MS debe ser múltiplo de TS_TICK_MS");
+static_assert(TS_ANGULO_MS % TS_TICK_MS == 0, "TS_ANGULO_MS debe ser múltiplo de TS_TICK_MS");
+static_assert(TS_GIRO_MS % TS_TICK_MS == 0,   "TS_GIRO_MS debe ser múltiplo de TS_TICK_MS");
+static_assert(TS_POSICION_MS % TS_TICK_MS == 0, "TS_POSICION_MS debe ser múltiplo de TS_TICK_MS");
 
 //==================================================
 // CONTROLADORES PI DE VELOCIDAD (MOTORES)
@@ -43,22 +51,31 @@ const float KP_2 = 0.070481;
 const float KI_2 = 2.0043;
 
 //==================================================
-// CONTROLADOR DE ANGULO (PD)
+// CONTROLADOR DE ANGULO (PID)
 //==================================================
-// rpm_ref = Kp*(angulo - ANGULO_EQUILIBRIO) + Kd*velocidad_caida
+// angulo = angulo_sensor + AJUSTE_ANGULO       (0° = carrito equilibrado)
+// e = angulo - set_point_desplazamiento        (set point: salida del
+//                                               controlador de desplazamiento)
+// rpm_ref = Kp*e + Ki*∫e + Kd*velocidad_caida
 // La acción derivativa usa directamente la velocidad de caída del giroscopio.
 // Su salida es la referencia de RPM común para ambos motores.
+// KI_ANGULO = 0 lo deja como PD.
 
-const float KP_ANGULO = 0.0f;           // rpm/°        POR SINTONIZAR
-const float KD_ANGULO = 0.0f;           // rpm/(°/s)    POR SINTONIZAR
+const float KP_ANGULO = 13.0f;           // rpm/°        POR SINTONIZAR
+const float KI_ANGULO = 0.0f;           // rpm/(°*s)    POR SINTONIZAR
+const float KD_ANGULO = 0.2f;           // rpm/(°/s)    POR SINTONIZAR
 const float RPM_MAX_ANGULO = 60.0f;     // Límite de la salida (±rpm)
-const float ANGULO_EQUILIBRIO = 0.0f;   // Ángulo medido con el carrito equilibrado (°)
 
-// Seguridad: fuera de ±ANGULO_CAIDA se apagan los motores y se reinician
-// los controladores. Se vuelve a controlar cuando el carrito se pone dentro
-// de ±ANGULO_REARME (también al arrancar).
+// Ajuste del sensor: se suma a la medida para que 0° sea el punto de
+// equilibrio. Se usa solo si no hay calibración guardada; el botón de
+// calibración lo fija en -(ángulo medido en equilibrio). Editable en la web.
+const float AJUSTE_ANGULO = 0.0f;       // °
+
+// Seguridad (sobre el ángulo ya ajustado): fuera de ±ANGULO_CAIDA se apagan
+// los motores y se reinician los controladores. Se vuelve a controlar cuando
+// el carrito se pone dentro de ±ANGULO_REARME (también al arrancar).
 const float ANGULO_CAIDA  = 30.0f;      // °
-const float ANGULO_REARME = 5.0f;       // °
+const float ANGULO_REARME = 10.0f;       // °
 
 //==================================================
 // CONTROLADOR DE GIRO (P o PI sobre la velocidad de giro en Z)
@@ -67,10 +84,27 @@ const float ANGULO_REARME = 5.0f;       // °
 // rpm_motor1 = rpm_angulo + u_giro,   rpm_motor2 = rpm_angulo - u_giro
 // KI_GIRO = 0 lo deja como proporcional puro.
 
-const float KP_GIRO = 0.0f;             // rpm/(°/s)   POR SINTONIZAR
+const float KP_GIRO = 0.01f;             // rpm/(°/s)   POR SINTONIZAR
 const float KI_GIRO = 0.0f;             // rpm/°       POR SINTONIZAR
 const float RPM_MAX_GIRO = 10.0f;       // Límite de la salida (±rpm)
 const float VEL_GIRO_REF = 0.0f;        // °/s; 0 = avanzar recto
+
+//==================================================
+// CONTROLADOR DE DESPLAZAMIENTO (PID sobre la posición)
+//==================================================
+// Es el lazo externo y su set point (POSICION_REF) es la única referencia
+// del sistema. Mantiene el carrito quieto en el punto donde empezó a equilibrar.
+//   x = ((cuentas1 + cuentas2)/2) * M_X_CUENTA     [m]   (desde ese punto)
+//   v = ((rpm1 + rpm2)/2) * PI*DIAMETRO_RUEDA/60   [m/s]
+//   set_point_angulo = Kp*(ref - x) + Ki*∫(ref - x) + Kd*(0 - v)   [°]
+// Su salida es el set point del controlador de ángulo: si el carrito avanzó
+// más allá de la referencia, pide inclinarse hacia atrás para que regrese.
+
+const float KP_POSICION = 15.0f;         // °/m          POR SINTONIZAR
+const float KI_POSICION = 5.0f;         // °/(m*s)      POR SINTONIZAR
+const float KD_POSICION = 0.2f;         // °/(m/s)      POR SINTONIZAR
+const float ANGULO_MAX_POSICION = 20.0f; // Límite del set point de ángulo (±°)
+const float POSICION_REF = 0.0f;        // m, respecto al punto de inicio (editable en la web)
 
 //==================================================
 // MPU6050
@@ -83,8 +117,9 @@ const uint32_t I2C_FRECUENCIA = 400000; // 400 kHz (modo rápido)
 
 // Frecuencia de muestreo = 1 kHz / (1 + SMPLRT_DIV) con el DLPF activo
 const uint8_t MPU_SMPLRT_DIV = 1;       // -> 500 Hz
-// DLPF_CFG = 2 -> giroscopio 98 Hz (2.8 ms), acelerómetro 94 Hz (3.0 ms)
-const uint8_t MPU_DLPF_CFG = 2;
+// DLPF_CFG (registro 0x1A): 2 -> giro 98 Hz (2.8 ms), acel 94 Hz (3.0 ms)
+//                           3 -> giro 42 Hz (4.8 ms), acel 44 Hz (4.9 ms)
+const uint8_t MPU_DLPF_CFG = 3;
 // GYRO_CONFIG FS_SEL: 0=±250, 1=±500, 2=±1000, 3=±2000 °/s
 const uint8_t MPU_RANGO_GIRO = 1;
 // ACCEL_CONFIG AFS_SEL: 0=±2, 1=±4, 2=±8, 3=±16 g
@@ -94,10 +129,16 @@ const uint8_t MPU_RANGO_ACEL = 0;
 // cuando no hay calibración guardada en la flash (carrito quieto ~1 s).
 const int MPU_MUESTRAS_CALIBRACION = 500;
 
-// Filtro complementario: constante de tiempo en la que se confía en el
-// giroscopio antes de corregir con el acelerómetro.
-// alfa = TAU / (TAU + TS_BASE)  -> 0.25 s a 2 ms da alfa = 0.992
-const float TAU_COMPLEMENTARIO = 0.25f; // s
+// Filtro de Kalman del ángulo de pitch (estado: ángulo [°], sesgo del giro [°/s]).
+// Predicción con el giroscopio, corrección con el ángulo del acelerómetro.
+//   Q_ANGULO grande -> sigue más al acelerómetro (más rápido, más ruido)
+//   R_MEDIDA grande -> confía menos en el acelerómetro (más suave)
+const float KALMAN_Q_ANGULO = 0.001f;
+const float KALMAN_Q_SESGO  = 0.003f;
+const float KALMAN_R_MEDIDA = 0.1f;
+// Rechazo de vibraciones: si |‖a‖ - 1 g| supera este valor no se corrige
+// con el acelerómetro en ese paso (solo se predice con el giroscopio).
+const float KALMAN_RECHAZO_G = 0.15f;
 
 // Montaje del MPU (0 = X, 1 = Y, 2 = Z)
 const int EJE_RUEDAS   = 1;  // eje paralelo al eje de las ruedas (eje de caída)
@@ -152,6 +193,10 @@ extern const float V_ZONA_MUERTA_2;
 //==================================================
 
 const float CPR = 1960;  // Cuentas por revolución en x4
+
+// Desplazamiento lineal por cuenta: perímetro de la rueda / CPR
+const float DIAMETRO_RUEDA = 0.067f;                  // m
+const float M_X_CUENTA = (PI * DIAMETRO_RUEDA) / CPR; // m por cuenta (~0.107 mm)
 
 // Promedio móvil de la medición de RPM (igual que en la identificación).
 // No cambia el tiempo de muestreo, pero agrega un retardo de ~(N-1)/2 muestras.

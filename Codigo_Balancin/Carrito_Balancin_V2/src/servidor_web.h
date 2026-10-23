@@ -10,7 +10,9 @@
                       para las gráficas (JSON)
     POST /motores     on=1 enciende, on=0 apaga
     GET  /parametros  constantes actuales de ángulo y giro (JSON)
-    POST /parametros  kpa, kda, ref, kpg, kig -> aplica y devuelve las actuales
+    POST /parametros  kpa, kia, kda, aja (ángulo: ganancias y ajuste del sensor),
+                      kpg, kig (giro), kpx, kix, kdx, xref (desplazamiento:
+                      ganancias y set point en m) -> aplica y devuelve las actuales
     GET  /bateria     voltaje de batería actual y rango aceptado (JSON)
     POST /bateria     v -> fija el voltaje de batería (ok = 0 si está fuera de rango)
 

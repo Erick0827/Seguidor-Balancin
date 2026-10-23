@@ -37,6 +37,10 @@ void aplicarVoltaje(Motor &m, float u);
 // Lee el encoder y actualiza m.rpm
 void medirRPM(Motor &m);
 
+// Cuentas acumuladas del encoder (de la última medirRPM) con el signo del
+// sentido del motor: positivas cuando el carrito avanza, en ambos motores
+long cuentasConSigno(const Motor &m);
+
 // Un paso del lazo de velocidad: PI sobre (ref - rpm) + zona muerta.
 // reiniciar = true apaga el motor y borra el estado del PI.
 void controlarVelocidad(Motor &m, float ref, bool reiniciar);

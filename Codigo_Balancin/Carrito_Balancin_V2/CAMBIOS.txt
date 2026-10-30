@@ -1,0 +1,336 @@
+HISTORIAL DE CAMBIOS - Carrito_Balancin_V2
+==========================================
+Cada entrada indica la fecha, qué cambió, en qué archivos y por qué.
+Las más recientes van al final.
+
+
+[2026-10-20] 1. Separación del código en módulos
+-------------------------------------------------
+Origen: el sketch único de Contexto_previo.txt (controladores_motores).
+Se dividió en src/ sin cambiar la lógica del control:
+  config.h / config.cpp            parámetros, ganancias, voltajes, pines
+  encoder.h / .cpp                 encoder x4 con PCNT
+  filtro_promedio.h / .cpp         promedio móvil de la RPM (antes dentro de Motor)
+  controlador_pi.h / .cpp          PI discreto con anti-windup (antes dentro de Motor)
+  motor.h / .cpp                   TB6612, medición de RPM, lazo de velocidad
+                                   (controlarPI pasó a llamarse controlarVelocidad)
+  lazo_control.h / .cpp            lazo periódico + cola de muestras
+  comunicacion_serial.h / .cpp     comandos por Serial e impresión de muestras
+  main.cpp                         solo setup() y loop()
+
+platformio.ini:
+  - platform cambiada a pioarduino (core Arduino 3.x / ESP-IDF 5). La
+    plataforma espressif32 oficial trae el core 2.x y el código no compila
+    (driver PCNT nuevo, ledcAttach).
+  - monitor_speed = 115200.
+
+
+[2026-10-20] 2. Carpeta de compilación fuera de la ruta con tildes
+-------------------------------------------------------------------
+platformio.ini: build_dir = C:/pio_build/Carrito_Balancin_V2
+Motivo: el enlazador fallaba con "cannot open map file" porque la ruta del
+proyecto contiene "Mecatrónica" (carácter no ASCII).
+
+
+[2026-10-20] 3. Corrección de la zona muerta (hecha por el usuario)
+--------------------------------------------------------------------
+config.cpp: V_ZONA_MUERTA_1/2 = (13/255)*V_BATERIA  ->  (13.0f/255.0f)*V_BATERIA
+Motivo: 13/255 es división entera y daba 0, la compensación no actuaba.
+Ahora vale ~0.63 V (motor 1) y ~0.53 V (motor 2) con 12.3 V.
+Se actualizó el comentario que lo explicaba.
+
+
+[2026-10-20] 4. Reparto de tareas entre núcleos y conexión WiFi
+----------------------------------------------------------------
+Reparto:
+  Núcleo 1  solo control: tarea "lazo_control", prioridad 20.
+  Núcleo 0  WiFi, lwIP, esp_timer, eventos de red y tarea "com_serial" (prioridad 5).
+
+lazo_control.cpp:
+  - El lazo ya no lo dispara un esp_timer (cuya tarea vive en el núcleo 0,
+    junto al WiFi), sino una tarea FreeRTOS fijada al núcleo 1 que usa
+    xTaskDelayUntil con el tick de 1 kHz (periodo exacto de TS_MS, sin
+    acumular deriva).
+  - Nuevo contador obtenerSobrepasos(): ciclos que no terminaron a tiempo.
+  - obtenerMuestra() acepta un tiempo de espera.
+comunicacion_serial.cpp:
+  - Ahora es una tarea en el núcleo 0 que espera bloqueada las muestras y
+    lee los comandos. Se reemplazan leerSerial()/imprimirMuestras() públicas
+    por iniciarComunicacionSerial().
+  - Los mensajes de estado se imprimen con prefijo '#' para filtrarlos.
+main.cpp:
+  - setup() arranca motores, control, comunicación y WiFi.
+  - loop() elimina su propia tarea (corría en el núcleo 1).
+config.h:
+  - Nuevas secciones NUCLEOS Y TAREAS (núcleos, prioridades, pilas) y WIFI
+    (nombre de host, ahorro de energía desactivado para menor latencia).
+wifi_red.h / .cpp (nuevo):
+  - Modo estación, no bloqueante, reconexión automática, avisa por Serial
+    al conectar (con la IP) y al perder la conexión.
+credenciales_wifi.h (nuevo, en .gitignore) y credenciales_wifi_ejemplo.h (plantilla).
+platformio.ini:
+  - board_build.extra_flags con ARDUINO_EVENT_RUNNING_CORE=0 para que la
+    tarea de eventos de red de Arduino corra en el núcleo 0 (el board la
+    ponía en el 1).
+.gitignore: se agrega src/credenciales_wifi.h.
+
+
+[2026-10-20] 5. WiFi como punto de acceso propio (corrección del cambio 4)
+---------------------------------------------------------------------------
+Objetivo corregido: el ESP32 no se conecta a una red, crea la suya (sin
+internet) para que los dispositivos se conecten directamente al carrito.
+wifi_red.h / .cpp:
+  - Modo WIFI_AP con softAPConfig + softAP. Avisa por Serial al crear la
+    red (con la IP) y cuando un dispositivo se conecta o desconecta.
+  - Funciones: iniciarWiFi(), clientesConectados(), wifiIP().
+config.h, sección WIFI: WIFI_AP_SSID "Balancin", WIFI_AP_CLAVE "balancin123",
+  canal 6, máx. 4 clientes, IP 192.168.4.1 (mismos datos del proyecto
+  Identifiacion_motores). Se quitan WIFI_NOMBRE_HOST y WIFI_AHORRO_ENERGIA.
+Eliminados: credenciales_wifi.h, credenciales_wifi_ejemplo.h y su línea en
+  .gitignore (la red es del propio carrito, ya no hay credenciales ajenas).
+
+
+[2026-10-20] 6. Se elimina el envío de muestras por Serial
+-----------------------------------------------------------
+Eliminados: comunicacion_serial.h / .cpp, la cola de muestras (struct
+  Muestra, obtenerMuestra) y el comando de referencia de RPM por Serial
+  (fijarReferenciaRPM): la referencia ahora la da el controlador de ángulo.
+config.h: se quita TAMANO_COLA_MUESTRAS.
+El Serial queda solo para mensajes de estado (prefijo '#').
+
+
+[2026-10-20] 7. MPU6050, controlador de ángulo y controlador de giro
+---------------------------------------------------------------------
+mpu6050.h / .cpp (nuevo): driver I2C (SDA 12, SCL 11, 0x68, 400 kHz).
+  - SMPLRT_DIV = 1  -> 1 kHz / (1+1) = 500 Hz.
+  - CONFIG DLPF_CFG = 2 -> giroscopio 98 Hz, acelerómetro 94 Hz.
+  - Giroscopio ±500 °/s, acelerómetro ±2 g.
+  - Calibración del offset del giroscopio al arrancar (500 muestras, ~1 s).
+imu.h / .cpp (nuevo):
+  - Ángulo de inclinación con filtro complementario a 500 Hz
+    (TAU = 0.25 s -> alfa = 0.992).
+  - Velocidad de caída = giroscopio en EJE_RUEDAS.
+  - Velocidad de giro = giroscopio en EJE_VERTICAL (Z), promediada en la
+    ventana de 100 ms del lazo de giro.
+  - Ejes y signos configurables en config.h (EJE_RUEDAS, EJE_VERTICAL,
+    SIGNO_ANGULO, SIGNO_GIRO); el signo del acelerómetro se deduce de los
+    ejes para que sea coherente con el giroscopio.
+controlador_pd.h / .cpp (nuevo): PD con derivada medida y saturación.
+controlador_pi.h / .cpp: se agrega ControladorPIPosicional (giro); con
+  Ki = 0 es un P puro. El PI de los motores no cambia.
+lazo_control.h / .cpp (reescrito): tarea multitasa en el núcleo 1, base 2 ms:
+  - cada 2 ms:   lectura del MPU + filtro + supervisión de seguridad
+  - cada 100 ms: giro, e = VEL_GIRO_REF - vel_giro -> u_giro (±20 rpm)
+  - cada 20 ms:  ángulo, rpm = Kp*(ang - ANGULO_EQUILIBRIO) + Kd*vel_caida,
+                 saturado a ±60 rpm
+  - cada 10 ms:  PI de motores con ref1 = rpm + u_giro, ref2 = rpm - u_giro
+  - El giro se suma a la REFERENCIA de RPM de cada motor (no al voltaje):
+    si se sumara al voltaje, el integrador del PI de velocidad lo anularía.
+  - Seguridad: fuera de ±30° o con 5 lecturas fallidas seguidas del MPU se
+    apagan motores y se reinician los controladores; se reanuda dentro de ±5°.
+  - iniciarLazoControl() ahora inicia el MPU y devuelve false si no responde.
+motor.cpp: controlarVelocidad() ya no reinicia el PI cuando ref == 0
+  (con el balanceo la referencia cruza 0 constantemente); solo con reiniciar.
+config.h: nuevas secciones TIEMPOS DE MUESTREO, CONTROLADOR DE ANGULO,
+  CONTROLADOR DE GIRO y MPU6050. Ganancias de ángulo y giro en 0 (por sintonizar).
+main.cpp: mensajes de calibración/estado; se quita la comunicación Serial.
+
+
+[2026-10-20] 8. Interfaz web de control
+----------------------------------------
+pagina_web.h (nuevo): página única HTML/CSS/JS sin librerías externas (la red
+  del carrito no tiene internet; las gráficas se dibujan en <canvas>).
+  1. Botón de encendido/apagado de motores + indicadores pequeños: conexión,
+     MPU con/sin señal, ángulo en/fuera de límites y estado con el motivo
+     de paro (apagado, esperando vertical, caída, MPU sin señal).
+  2. Gráficas de los últimos 10 s (contraíble): ángulo (set point y medido)
+     y RPM (set point y medida) con selector Ambos / Motor 1 / Motor 2.
+  3. Constantes (contraíble): Kp, Kd y set point del controlador de ángulo;
+     Kp y Ki del controlador de giro. Botón Aplicar.
+  La página consulta /datos cada 200 ms.
+servidor_web.h / .cpp (nuevo): WebServer del core en una tarea del núcleo 0
+  (prioridad 5, debajo de WiFi y lwIP), puerto 80. Rutas: /, /datos,
+  /motores (POST), /parametros (GET/POST).
+lazo_control.h / .cpp:
+  - Habilitación de motores (habilitarMotores). Al arrancar los motores
+    están APAGADOS hasta pulsar el botón en la web.
+  - Estado público (EstadoControl) con el motivo de paro (MotivoParo).
+  - Ganancias de ángulo/giro y set point de ángulo ajustables en caliente
+    (ParametrosControl); el integrador del giro no se borra al cambiarlas.
+  - Cola de muestras (una cada 20 ms: set point y ángulo, ref y rpm de
+    cada motor); si se llena se descarta la más vieja.
+  - Los datos compartidos entre núcleos se protegen con un portMUX.
+  - Si el MPU no responde al iniciar, la tarea de control arranca igual (con
+    los motores apagados) para poder mostrar el estado en la web.
+  - Los límites de caída/rearme se miden respecto al set point de ángulo.
+config.h: nueva sección INTERFAZ WEB (WEB_PUERTO = 80, TAMANO_COLA_MUESTRAS = 150).
+main.cpp: arranca el servidor web después del WiFi.
+Nota: los cambios de constantes desde la web NO se guardan al reiniciar
+  (escribir en flash detiene momentáneamente ambos núcleos); una vez
+  sintonizadas, copiarlas a config.h.
+
+
+[2026-10-20] 9. Cambio del usuario en config.h
+-----------------------------------------------
+RPM_MAX_GIRO: 20 -> 10 rpm.
+
+
+[2026-10-20] 10. Botón de calibración (GPIO14) con guardado en flash
+---------------------------------------------------------------------
+Rutina al pulsar (botón GPIO14 a GND, pull-up interno):
+  1. Solo arranca con los motores apagados; si están encendidos se rechaza
+     y la web pide apagarlos.
+  2. Espera 1.5 s (CAL_ESPERA_MS) con un indicador parpadeando en la web.
+  3. Toma 500 muestras cada 2 ms (1 s) acumulando giroscopio y acelerómetro.
+  4. Si la desviación estándar del giroscopio supera 0.5 °/s en algún eje,
+     cancela y la web indica el error y pide repetir.
+  5. Bias del giroscopio = promedio; ángulo de equilibrio = ángulo del
+     acelerómetro promediado (pasa a ser el set point de ángulo).
+  6. Guarda ambos en la flash (NVS, espacio "balancin").
+Archivos nuevos:
+  boton.h / .cpp           lectura por sondeo cada 2 ms con antirrebote de 20 ms
+  calibracion.h / .cpp     máquina de estados de la rutina (corre en la tarea de
+                           control, núcleo 1, usando las mismas lecturas del MPU)
+  almacenamiento.h / .cpp  guardar/cargar calibración con Preferences
+Cambios:
+  config.h: sección BOTON DE CALIBRACION (pin, antirrebote, tiempos, umbral).
+  mpu6050: obtenerOffsetGiro() / fijarOffsetGiro().
+  imu: iniciarIMU(biasGiro) usa el bias guardado o calibra si es NULL;
+       nuevas ultimaLecturaIMU(), anguloDesdeAcelerometro(), fijarAnguloIMU().
+  lazo_control:
+    - Al arrancar carga la calibración de la flash: si existe, usa ese bias
+      y ese ángulo de equilibrio y ya NO calibra el giroscopio al encender
+      (no hace falta tener el carrito quieto). Si no existe, calibra como antes
+      y usa ANGULO_EQUILIBRIO de config.h.
+    - Nuevo motivo de paro PARO_CALIBRANDO. Durante la calibración los
+      motores se apagan y el botón de la web no los enciende; al terminar
+      quedan apagados.
+    - Tras escribir en la flash se reinicia la referencia de tiempo de la
+      tarea para no recuperar de golpe los ciclos perdidos.
+  servidor_web: /datos agrega "cal" (estado) y "ctxt" (texto del indicador).
+  pagina_web: indicador de calibración (parpadea mientras espera/muestrea,
+    verde al terminar, rojo en error; se oculta a los 10 s). El botón de
+    motores se deshabilita mientras calibra. Al calibrar bien se recarga el
+    set point de ángulo en el formulario.
+  main.cpp: los mensajes de calibración al arrancar los imprime lazo_control.
+
+
+[2026-10-21] 11. Cambio del usuario en config.cpp
+--------------------------------------------------
+V_BATERIA: 12.3 -> 8.1 V (medición del usuario). Es el valor al arrancar.
+
+
+[2026-10-21] 12. Voltaje de batería ingresado desde la interfaz web
+--------------------------------------------------------------------
+pagina_web.h: nueva sección contraíble "Batería" con el voltaje actual,
+  campo para ingresarlo y botón Aplicar (avisa si está fuera de rango).
+servidor_web: nueva ruta /bateria (GET devuelve el voltaje y el rango;
+  POST v=... lo fija).
+lazo_control: obtenerVoltajeBateria() / fijarVoltajeBateria(v). La web deja
+  el valor pendiente y la tarea de control lo copia a V_BATERIA al inicio
+  del siguiente ciclo (V_BATERIA solo se escribe desde el núcleo 1).
+config.h: rango aceptado V_BATERIA_MIN = 4.5 V, V_BATERIA_MAX = 13.5 V.
+Notas:
+  - El valor ingresado no se guarda en la flash; al reiniciar vuelve al de
+    config.cpp.
+  - La zona muerta (V_ZONA_MUERTA_1/2) sigue calculada una sola vez al
+    arrancar con el V_BATERIA de config.cpp; no cambia con el valor de la web.
+
+
+[2026-10-22] 13. Cambios del usuario en config.h
+-------------------------------------------------
+KP_ANGULO: 0 -> 13 rpm/°,  KD_ANGULO: 0 -> 0.2 rpm/(°/s).
+SENTIDO_MOTOR_1: 1 -> -1,  SENTIDO_MOTOR_2: -1 -> 1.
+
+
+[2026-10-22] 14. Filtro de Kalman para el ángulo de pitch
+----------------------------------------------------------
+Motivo: las vibraciones de la estructura hacían muy ruidoso el ángulo del
+filtro complementario. Se reemplaza por un Kalman de 2 estados.
+filtro_kalman.h / .cpp (nuevo):
+  - Estado x = [ángulo (°), sesgo del giroscopio (°/s)].
+  - predecirKalman(): con la velocidad angular del giroscopio.
+  - corregirKalman(): con el ángulo del acelerómetro (atan2).
+config.h:
+  - KALMAN_Q_ANGULO = 0.001, KALMAN_Q_SESGO = 0.003, KALMAN_R_MEDIDA = 0.1.
+  - KALMAN_RECHAZO_G = 0.15: si |‖a‖ - 1 g| > 0.15 g se omite la corrección
+    y solo se predice (rechazo de vibraciones).
+  - TS_KALMAN_MS = 5 (periodo fijo del filtro).
+  - TS_TICK_MS = 1: la tarea de control ahora despierta cada 1 ms para poder
+    ejecutar el filtro cada 5 ms. NO cambian los tiempos de los
+    controladores (motores 10 ms, ángulo 20 ms, giro 100 ms) ni la lectura
+    del MPU, el botón, la calibración y la seguridad (siguen cada 2 ms).
+  - MPU_DLPF_CFG: 2 -> 3 (registro 0x1A): giroscopio 98 -> 42 Hz,
+    acelerómetro 94 -> 44 Hz. Agrega ~2 ms de retardo al giroscopio
+    (afecta la acción derivativa del ángulo y la velocidad de giro en Z).
+  - Se elimina TAU_COMPLEMENTARIO (filtro complementario retirado).
+imu.h / .cpp:
+  - actualizarIMU() (cada 2 ms) ya no calcula el ángulo; solo guarda la
+    lectura, la velocidad de caída y acumula la velocidad de giro.
+  - Nueva actualizarAnguloKalman() (cada 5 ms): predicción con la velocidad
+    de caída (giroscopio Y, mismo signo que antes), corrección con
+    anguloDesdeAcelerometro() (mismos ejes y signos que antes) si pasa el
+    rechazo de vibraciones.
+  - fijarAnguloIMU() reinicia el Kalman: ángulo = acelerómetro, sesgo = 0
+    (el driver ya resta el bias calibrado; el Kalman estima el residuo), P = 0.
+    La calibración del botón (500 muestras) y el arranque lo usan como antes.
+  - anguloInclinacion() devuelve el ángulo del Kalman.
+lazo_control.cpp: orden por ciclo de 1 ms: [2 ms] lectura MPU + calibración
+  -> [5 ms] Kalman -> [2 ms] seguridad -> giro / ángulo / motores.
+Sin cambios: ganancias, límites, anti-windup, lógica de motores y de giro,
+  velocidadCaida() (acción derivativa con el giroscopio como antes),
+  calibracion.cpp, mpu6050.cpp, web.
+
+
+[2026-10-22] 15. Control de desplazamiento y acción integral en el ángulo
+--------------------------------------------------------------------------
+Objetivo: que el carrito, al equilibrarse, se mantenga en una sola posición.
+Controlador de desplazamiento (PID, cada 100 ms = TS_POSICION_MS):
+  - x = ((cuentas1 + cuentas2)/2) * M_X_CUENTA [m], con
+    M_X_CUENTA = PI*0.067/1960 (DIAMETRO_RUEDA / CPR en config.h).
+    Las cuentas llevan el signo de SENTIDO_MOTOR_x (positivas al avanzar en
+    ambos motores). Se calcula en float, sin la división entera de la
+    fórmula original, para no perder media cuenta.
+  - x se mide desde el punto donde el carrito empezó a equilibrar (cada vez
+    que se activa el control se toma un nuevo origen).
+  - Acción derivativa con la velocidad lineal v = ((rpm1+rpm2)/2)*PI*D/60 [m/s]
+    (rpm ya medidas y filtradas por el lazo de motores).
+  - corrección = Kp*(0-x) + Ki*∫(0-x) + Kd*(0-v), limitada a ±5°
+    (ANGULO_MAX_POSICION). Se suma al set point del controlador de ángulo.
+  - Ganancias KP/KI/KD_POSICION en 0 (por sintonizar).
+Controlador de ángulo: pasa de PD a PID; nueva KI_ANGULO = 0 (con Ki = 0
+  se comporta exactamente igual que antes). El integrador se borra al detenerse.
+Controlador de giro: ya tenía Ki (KI_GIRO), editable en config.h y en la web.
+Archivos:
+  controlador_pid.h / .cpp (nuevo, reemplaza a controlador_pd.h / .cpp, eliminados).
+  config.h: TS_POSICION_MS, KI_ANGULO, sección CONTROLADOR DE DESPLAZAMIENTO,
+            DIAMETRO_RUEDA y M_X_CUENTA (sección ENCODERS).
+  motor.h / .cpp: cuentasConSigno().
+  lazo_control.h / .cpp: lazoPosicion() antes de lazoAngulo(); activarControl()
+    fija el origen de posición; ParametrosControl con kiAngulo, kpPosicion,
+    kiPosicion, kdPosicion; la gráfica de ángulo muestra el set point efectivo
+    (set point + corrección de desplazamiento).
+  servidor_web.cpp / pagina_web.h: campos Ki de ángulo y Kp/Ki/Kd de
+    desplazamiento (claves kia, kpx, kix, kdx).
+
+
+[2026-10-22] 16. El desplazamiento da el set point de ángulo; ajuste del sensor
+--------------------------------------------------------------------------------
+Problema reportado: el carrito tendía a irse hacia una sola dirección.
+Nueva estructura de referencias:
+  - El único set point que entra al sistema es el de desplazamiento
+    (POSICION_REF, en m respecto al punto de inicio; editable en la web).
+  - La salida del controlador de desplazamiento ES el set point del
+    controlador de ángulo (±5°), ya no una corrección sumada a otro set point.
+  - Se elimina el set point manual de ángulo. En su lugar hay un ajuste del
+    sensor que se suma a la medida: ángulo = ángulo_sensor + AJUSTE_ANGULO,
+    de modo que 0° sea el punto de equilibrio.
+  - La calibración del botón ahora fija el ajuste en -(ángulo de equilibrio)
+    (se sigue guardando el mismo dato en la flash; al arrancar se carga así).
+  - Los límites de caída (±30°) y rearme (±5°) se miden sobre el ángulo ajustado.
+  - Las gráficas muestran el ángulo ajustado y el set point que da el desplazamiento.
+config.h: ANGULO_EQUILIBRIO -> AJUSTE_ANGULO (°); nuevo POSICION_REF (m).
+lazo_control.h / .cpp: ParametrosControl: anguloRef -> ajusteAngulo, nuevo
+  posicionRef; anguloAjustado(); lazoPosicion() produce anguloRef.
+servidor_web.cpp / pagina_web.h: campo "ref" (set point de ángulo) reemplazado
+  por "aja" (Ajuste sensor, °); nuevo "xref" (Set point de desplazamiento, m).
